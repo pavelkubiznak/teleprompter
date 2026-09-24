@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-title" content="Prompter">
+<meta name="theme-color" content="#000000">
+<title>Teleprompter</title>
+<style>
+  :root { --fg:#fff; --dim:#6b6b6b; --accent:#ffcc00; --bg:#000; --panel:#1b1b1b; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  button { font:inherit; color:inherit; background:#2a2a2a; border:1px solid #444; border-radius:10px;
+    padding:10px 14px; cursor:pointer; touch-action:manipulation; }
+  button.primary { background:var(--accent); color:#000; border-color:var(--accent); font-weight:600; }
+  button.on { background:#c62828; border-color:#c62828; }
+  .hidden { display:none !important; }
+
+  /* ---------- editor ---------- */
+  #editor { display:flex; flex-direction:column; height:100%; max-width:900px; margin:0 auto;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); gap:12px; }
+  #editor h1 { margin:0; font-size:22px; }
+  #text { flex:1; width:100%; resize:none; background:var(--panel); color:var(--fg); border:1px solid #333;
+    border-radius:12px; padding:14px; font:inherit; font-size:17px; line-height:1.5; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  .row label { display:flex; gap:8px; align-items:center; }
+  .warn { background:#4a3b00; color:#ffe08a; padding:10px 12px; border-radius:10px; font-size:14px; }
+
+  /* ---------- prompter ---------- */
+  #prompter { position:fixed; inset:0; overflow:hidden; background:#000; touch-action:none; }
+  #stage { position:absolute; inset:0; }
+  #stage.mirror { transform: scaleX(-1); }
+  #content { position:relative; padding:0 6vw 100vh; line-height:1.35; font-weight:600;
+    will-change: transform; }
+  #content .w { transition: color .25s; }
+  #content .w.done { color:var(--dim); }
+  #content .gap { display:block; height:.6em; }
+  #marker { position:absolute; left:0; width:0; height:0; border-top:14px solid transparent;
+    border-bottom:14px solid transparent; border-left:18px solid var(--accent); transform:translateY(-50%); }
+  #bar { position:absolute; top:0; left:0; right:0; display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+    padding: max(8px, env(safe-area-inset-top)) 10px 8px; background:linear-gradient(#000e, #0000);
+    opacity:.35; transition:opacity .3s; z-index:2; }
+  #bar:hover, #bar.show { opacity:1; }
+  #bar button { padding:8px 12px; font-size:15px; }
+  #heard { position:absolute; left:0; right:0; bottom:0; padding:6px 12px max(6px, env(safe-area-inset-bottom));
+    font-size:13px; color:#777; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; z-index:2; }
+</style>
+</head>
+<body>
+
+<section id="editor">
+  <h1>Teleprompter</h1>
+  <div id="nosr" class="warn hidden">Tento prohlížeč neumí rozpoznávat řeč. Na iPhonu použij Safari, na počítači Chrome nebo Safari. Text půjde posouvat jen ručně.</div>
+  <textarea id="text" placeholder="Sem vlož text…"></textarea>
+  <div class="row">
+    <label>Písmo <input id="size" type="range" min="20" max="120" step="2"> <span id="sizeVal"></span></label>
+    <label><input id="mirror" type="checkbox"> Zrcadlit</label>
+    <span style="flex:1"></span>
+    <button id="go" class="primary">Spustit ▶</button>
+  </div>
+</section>
+
+<section id="prompter" class="hidden">
+  <div id="stage">
+    <div id="content"></div>
+    <div id="marker"></div>
+  </div>
+  <div id="bar">
+    <button id="back">✎ Text</button>
+    <button id="mic">🎤 Start</button>
+    <button id="top">⤒ Začátek</button>
+    <button id="smaller">A−</button>
+    <button id="bigger">A+</button>
+    <button id="flip">⇋ Zrcadlo</button>
+  </div>
+  <div id="heard"></div>
+</section>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  // ---------- settings ----------
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem('tp_' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem('tp_' + k, JSON.stringify(v)); } catch {} }
+  };
+  const defaultSize = Math.round(Math.min(72, Math.max(30, innerWidth / 14)));
+  let fontSize = store.get('size', defaultSize);
+  let mirror = store.get('mirror', false);
+  $('text').value = store.get('text', '');
+  $('size').value = fontSize; $('sizeVal').textContent = fontSize;
+  $('mirror').checked = mirror;
+  if (!SR) $('nosr').classList.remove('hidden');
+
+  $('text').addEventListener('input', () => store.set('text', $('text').value));
+  $('size').addEventListener('input', e => setSize(+e.target.value));
+  $('mirror').addEventListener('change', e => setMirror(e.target.checked));
+
+  function setSize(v) {
+    fontSize = Math.max(20, Math.min(120, v));
+    store.set('size', fontSize);
+    $('size').value = fontSize; $('sizeVal').textContent = fontSize;
+    $('content').style.fontSize = fontSize + 'px';
+    layout();
+    if (!$('prompter').classList.contains('hidden')) snapToPos();
+  }
+  function setMirror(v) {
+    mirror = v; store.set('mirror', v); $('mirror').checked = v;
+    $('stage').classList.toggle('mirror', v);
+  }
+
+  // ---------- text -> words ----------
+  const norm = s => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
+  let W = [];      // normalized words (only matchable ones)
+  let spans = [];  // span element for each W index
+  let pos = 0;     // index of the next word to be read
+
+  function build(text) {
+    const content = $('content');
+    content.innerHTML = '';
+    W = []; spans = [];
+    const paras = text.replace(/\r/g, '').split(/\n\s*\n/);
+    paras.forEach((para, pi) => {
+      if (pi) content.appendChild(Object.assign(document.createElement('span'), { className: 'gap' }));
+      para.split('\n').forEach((line, li) => {
+        if (li) content.appendChild(document.createElement('br'));
+        line.split(/\s+/).filter(Boolean).forEach(tok => {
+          const span = document.createElement('span');
+          span.textContent = tok;
+          const n = norm(tok);
+          if (n) { span.className = 'w'; W.push(n); spans.push(span); }
+          content.appendChild(span);
+          content.appendChild(document.createTextNode(' '));
+        });
+      });
+    });
+  }
+
+  // ---------- fuzzy matching ----------
+  function lev(a, b) {
+    if (Math.abs(a.length - b.length) > 2) return 3;
+    let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= b.length; j++)
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+  // 0..1 similarity; tolerant of Czech word endings and small recognition errors
+  function sim(a, b) {
+    if (a === b) return 1;
+    const m = Math.min(a.length, b.length);
+    if (m < 4) return 0;
+    const p = Math.max(3, m - 2);
+    if (a.slice(0, p) === b.slice(0, p)) return 0.8;
+    const d = lev(a, b);
+    if (d <= 1) return 0.8;
+    if (m >= 7 && d <= 2) return 0.6;
+    return 0;
+  }
+  const weight = w => w.length <= 2 ? 0.4 : w.length <= 3 ? 0.7 : 1;
+
+  // how well do the last spoken words line up with the script ending at index e?
+  function alignScore(spoken, e) {
+    let si = spoken.length - 1, sj = e, score = 0, misses = 0;
+    while (si >= 0 && sj >= 0 && misses <= 3) {
+      const s = sim(spoken[si], W[sj]);
+      if (s) { score += s * weight(W[sj]); si--; sj--; continue; }
+      misses++;
+      if (sj > 0 && sim(spoken[si], W[sj - 1])) { sj--; continue; }       // reader skipped a word
+      if (si > 0 && sim(spoken[si - 1], W[sj])) { si--; continue; }       // recognizer added a word
+      si--; sj--;
+    }
+    return score - misses * 0.3;
+  }
+
+  const AHEAD = 40;
+  function handleSpeech(transcript) {
+    $('heard').textContent = transcript.trim().split(/\s+/).slice(-12).join(' ');
+    const spoken = transcript.split(/\s+/).map(norm).filter(Boolean).slice(-8);
+    if (!spoken.length || !W.length) return;
+    const last = spoken[spoken.length - 1];
+    let best = -1, bestScore = 0;
+    for (let e = pos; e < Math.min(W.length, pos + AHEAD); e++) {
+      if (!sim(last, W[e])) continue;
+      const score = alignScore(spoken, e);
+      const dist = e - pos;
+      const need = dist <= 2 ? 0.8 : dist <= 15 ? 1.6 : 2.5;
+      if (score < need) continue;
+      const adj = score - dist * 0.03;
+      if (adj > bestScore) { bestScore = adj; best = e; }
+    }
+    if (best >= 0) setPos(best + 1);
+  }
+
+  // ---------- position & scrolling ----------
+  let offset = 0, target = 0;
+  const readLine = () => Math.round(innerHeight * 0.32);
+
+  function setPos(p, snap) {
+    p = Math.max(0, Math.min(W.length, p));
+    const lo = Math.min(p, pos), hi = Math.max(p, pos);
+    for (let i = lo; i < hi; i++) spans[i].classList.toggle('done', i < p);
+    pos = p;
+    if (snap !== false) snapToPos();
+  }
+  function wordY(i) {
+    const s = spans[Math.min(i, spans.length - 1)];
+    return s ? s.offsetTop + s.offsetHeight / 2 : 0;
+  }
+  function snapToPos() {
+    if (!spans.length) return;
+    target = Math.max(0, wordY(pos) - readLine());
+  }
+  function posAtOffset(off) {
+    const y = off + readLine();
+    for (let i = 0; i < spans.length; i++) if (spans[i].offsetTop + spans[i].offsetHeight >= y) return i;
+    return spans.length;
+  }
+  function manualScroll(dy) {
+    const max = spans.length ? wordY(spans.length - 1) : 0;
+    target = Math.max(0, Math.min(max, target + dy));
+    offset = target;
+    setPos(posAtOffset(target), false);
+    showBar();
+  }
+  function frame() {
+    offset += (target - offset) * 0.12;
+    if (Math.abs(target - offset) < 0.5) offset = target;
+    $('content').style.transform = `translateY(${-offset}px)`;
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- microphone ----------
+  let rec = null, listening = false;
+  function startMic() {
+    if (!SR) { alert('Tento prohlížeč neumí rozpoznávat řeč. Na iPhonu použij Safari, na počítači Chrome nebo Safari.'); return; }
+    listening = true; micUI();
+    if (!rec) {
+      rec = new SR();
+      rec.lang = 'cs-CZ';
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.onresult = e => {
+        // only the tail matters; walk back until we have enough words
+        let t = '';
+        for (let i = e.results.length - 1; i >= 0 && t.split(/\s+/).length < 10; i--)
+          t = e.results[i][0].transcript + ' ' + t;
+        handleSpeech(t);
+      };
+      rec.onerror = e => {
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          listening = false; micUI();
+          alert('Mikrofon nebo rozpoznávání řeči není povolené. Povol ho v nastavení prohlížeče.');
+        }
+      };
+      // browsers end the session after silence or a time limit -> restart while we want to listen
+      rec.onend = () => { if (listening) setTimeout(restart, 120); };
+    }
+    try { rec.start(); } catch {}
+  }
+  function restart() { if (!listening) return; try { rec.start(); } catch { setTimeout(restart, 400); } }
+  function stopMic() { listening = false; micUI(); try { rec && rec.stop(); } catch {} }
+  function micUI() {
+    $('mic').textContent = listening ? '■ Stop' : '🎤 Start';
+    $('mic').classList.toggle('on', listening);
+  }
+
+  // ---------- screen wake lock ----------
+  let wake = null;
+  async function keepAwake() { try { wake = await navigator.wakeLock.request('screen'); } catch {} }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !$('prompter').classList.contains('hidden')) keepAwake();
+  });
+
+  // ---------- screens ----------
+  function openPrompter() {
+    build($('text').value);
+    $('editor').classList.add('hidden');
+    $('prompter').classList.remove('hidden');
+    $('content').style.fontSize = fontSize + 'px';
+    setMirror(mirror);
+    layout();
+    pos = 0; offset = target = 0;
+    setPos(0);
+    $('heard').textContent = '';
+    keepAwake();
+    showBar();
+  }
+  function closePrompter() {
+    stopMic();
+    try { wake && wake.release(); } catch {}
+    $('prompter').classList.add('hidden');
+    $('editor').classList.remove('hidden');
+  }
+
+  let barTimer;
+  function showBar() {
+    $('bar').classList.add('show');
+    clearTimeout(barTimer);
+    barTimer = setTimeout(() => $('bar').classList.remove('show'), 2500);
+  }
+
+  $('go').onclick = openPrompter;
+  $('back').onclick = closePrompter;
+  $('mic').onclick = () => listening ? stopMic() : startMic();
+  $('top').onclick = () => { setPos(0); offset = target; };
+  $('smaller').onclick = () => setSize(fontSize - 4);
+  $('bigger').onclick = () => setSize(fontSize + 4);
+  $('flip').onclick = () => setMirror(!mirror);
+
+  // manual control: wheel, touch drag, keyboard
+  $('prompter').addEventListener('wheel', e => { e.preventDefault(); manualScroll(e.deltaY); }, { passive: false });
+  let touchY = null;
+  $('stage').addEventListener('touchstart', e => { touchY = e.touches[0].clientY; showBar(); }, { passive: true });
+  $('stage').addEventListener('touchmove', e => {
+    if (touchY === null) return;
+    const y = e.touches[0].clientY;
+    manualScroll(touchY - y); touchY = y;
+  }, { passive: true });
+  $('stage').addEventListener('touchend', () => { touchY = null; });
+  $('stage').addEventListener('click', showBar);
+  document.addEventListener('keydown', e => {
+    if ($('prompter').classList.contains('hidden')) return;
+    const line = fontSize * 1.35;
+    if (e.key === 'ArrowDown' || e.key === 'PageDown') { e.preventDefault(); manualScroll(e.key === 'PageDown' ? line * 4 : line); }
+    else if (e.key === 'ArrowUp' || e.key === 'PageUp') { e.preventDefault(); manualScroll(e.key === 'PageUp' ? -line * 4 : -line); }
+    else if (e.key === ' ') { e.preventDefault(); listening ? stopMic() : startMic(); }
+    else if (e.key === 'Escape') closePrompter();
+    else if (e.key === 'm') setMirror(!mirror);
+  });
+  // first line starts at the reading line, marked by the yellow arrow
+  function layout() {
+    $('marker').style.top = readLine() + 'px';
+    $('content').style.paddingTop = (readLine() - fontSize * 0.7) + 'px';
+  }
+  addEventListener('resize', () => { layout(); snapToPos(); });
+
+  requestAnimationFrame(frame);
+
+  // exposed for testing in the console
+  window.tp = { handleSpeech, get pos() { return pos; }, get words() { return W; } };
+})();
+</script>
+</body>
+</html>
