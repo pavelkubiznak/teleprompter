@@ -105,23 +105,83 @@
     $('size').value = fontSize; $('sizeVal').textContent = fontSize;
     $('content').style.fontSize = fontSize + 'px';
     layout();
-    if (!$('prompter').classList.contains('hidden')) snapToPos();
   }
   function setMirror(v) {
     mirror = v; store.set('mirror', v); $('mirror').checked = v;
     $('stage').classList.toggle('mirror', v);
   }
 
-  // ---------- text -> words ----------
+  // ---------- text -> comparable words ----------
   const norm = s => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
-  let W = [];      // normalized words (only matchable ones)
-  let spans = [];  // span element for each W index
-  let pos = 0;     // index of the next word to be read
+
+  // abbreviations are read out in full
+  const ABBR = {
+    napr: ['napriklad'], atd: ['a', 'tak', 'dale'], apod: ['a', 'podobne'], tzn: ['to', 'znamena'],
+    tj: ['to', 'jest'], tzv: ['takzvany'], resp: ['respektive'], mj: ['mimo', 'jine'], cca: ['cirka'],
+    popr: ['popripade'], kc: ['korun'], ks: ['kusu']
+  };
+  // one written token -> normalized spoken words ("10%" -> 10 procent, "např." -> napriklad)
+  function tokenParts(tok) {
+    const t = tok.replace(/%/g, ' procent ').replace(/&/g, ' a ').replace(/€/g, ' eur ').replace(/\+/g, ' plus ')
+      .replace(/[-–—\/]/g, ' ').replace(/(\d)(\p{L})/gu, '$1 $2').replace(/(\p{L})(\d)/gu, '$1 $2');
+    const out = [];
+    for (const p of t.split(/\s+/)) {
+      const n = norm(p);
+      if (n) out.push(...(ABBR[n] || [n]));
+    }
+    return out;
+  }
+
+  // Czech number words -> digits, applied to both the script and the speech,
+  // so "2026" matches "dva tisíce dvacet šest" either way round
+  const NUM = {
+    nula: 0, jeden: 1, jedna: 1, jedno: 1, jednoho: 1, jedne: 1, jednom: 1, dva: 2, dve: 2, dvou: 2, dvema: 2,
+    tri: 3, trech: 3, trem: 3, tremi: 3, ctyri: 4, ctyrech: 4, ctyrem: 4, ctyrmi: 4, pet: 5, peti: 5, sest: 6, sesti: 6,
+    sedm: 7, sedmi: 7, osm: 8, osmi: 8, devet: 9, deviti: 9, deset: 10, deseti: 10, jedenact: 11, dvanact: 12,
+    trinact: 13, ctrnact: 14, patnact: 15, sestnact: 16, sedmnact: 17, osmnact: 18, devatenact: 19,
+    dvacet: 20, dvaceti: 20, tricet: 30, triceti: 30, ctyricet: 40, ctyriceti: 40, padesat: 50, padesati: 50,
+    sedesat: 60, sedesati: 60, sedmdesat: 70, sedmdesati: 70, osmdesat: 80, osmdesati: 80, devadesat: 90, devadesati: 90
+  };
+  const HUNDRED = new Set(['sto', 'ste', 'sta', 'set', 'stech']);
+  const MULT = { tisic: 1e3, tisice: 1e3, tisicu: 1e3, tisici: 1e3, milion: 1e6, miliony: 1e6, milionu: 1e6, miliarda: 1e9, miliardy: 1e9, miliard: 1e9 };
+  const isDigits = n => /^\d+$/.test(n);
+  const isNum = n => n in NUM || HUNDRED.has(n) || n in MULT || isDigits(n);
+
+  // items: [{n, spans}] -> number runs merged into one digit item
+  function canon(items) {
+    const out = [];
+    for (let i = 0; i < items.length;) {
+      if (!isNum(items[i].n)) { out.push(items[i++]); continue; }
+      let total = 0, cur = 0, prevDigits = false;
+      const spans = [];
+      for (; i < items.length && isNum(items[i].n); i++) {
+        const n = items[i].n;
+        if (isDigits(n)) {
+          // "1 000 000" -> thousands groups
+          cur = prevDigits && n.length === 3 ? cur * 1000 + +n : cur + +n;
+          prevDigits = true;
+        } else {
+          prevDigits = false;
+          if (n in NUM) cur += NUM[n];
+          else if (HUNDRED.has(n)) cur = (cur || 1) * 100;
+          else { total += (cur || 1) * MULT[n]; cur = 0; }
+        }
+        if (items[i].spans) spans.push(...items[i].spans);
+      }
+      out.push({ n: String(total + cur), spans });
+    }
+    return out;
+  }
+  const spokenWords = t => canon(t.split(/\s+/).flatMap(tokenParts).map(n => ({ n }))).map(x => x.n);
+
+  let W = [];       // comparable words of the script
+  let wSpans = [];  // spans displaying each W word
+  let pos = 0;      // index of the next word to be read (confirmed by speech)
 
   function build(text) {
     const content = $('content');
     content.innerHTML = '';
-    W = []; spans = [];
+    const items = [];
     const paras = text.replace(/\r/g, '').split(/\n\s*\n/);
     paras.forEach((para, pi) => {
       if (pi) content.appendChild(Object.assign(document.createElement('span'), { className: 'gap' }));
@@ -130,13 +190,17 @@
         line.split(/\s+/).filter(Boolean).forEach(tok => {
           const span = document.createElement('span');
           span.textContent = tok;
-          const n = norm(tok);
-          if (n) { span.className = 'w'; W.push(n); spans.push(span); }
+          const parts = tokenParts(tok);
+          if (parts.length) span.className = 'w';
+          parts.forEach(n => items.push({ n, spans: [span] }));
           content.appendChild(span);
           content.appendChild(document.createTextNode(' '));
         });
       });
     });
+    const c = canon(items);
+    W = c.map(x => x.n);
+    wSpans = c.map(x => x.spans);
   }
 
   // ---------- fuzzy matching ----------
@@ -166,72 +230,112 @@
   const weight = w => w.length <= 2 ? 0.4 : w.length <= 3 ? 0.7 : 1;
 
   // how well do the last spoken words line up with the script ending at index e?
+  // gaps inside the matched run cost points; older words that no longer align are free
   function alignScore(spoken, e) {
-    let si = spoken.length - 1, sj = e, score = 0, misses = 0;
+    let si = spoken.length - 1, sj = e, score = 0, misses = 0, paid = 0;
     while (si >= 0 && sj >= 0 && misses <= 3) {
       const s = sim(spoken[si], W[sj]);
-      if (s) { score += s * weight(W[sj]); si--; sj--; continue; }
+      if (s) { score += s * weight(W[sj]); paid = misses; si--; sj--; continue; }
       misses++;
       if (sj > 0 && sim(spoken[si], W[sj - 1])) { sj--; continue; }       // reader skipped a word
       if (si > 0 && sim(spoken[si - 1], W[sj])) { si--; continue; }       // recognizer added a word
       si--; sj--;
     }
-    return score - misses * 0.3;
+    return score - paid * 0.3;
   }
 
-  const AHEAD = 40;
+  const AHEAD = 40, BACK = 40;
+  let lastHeard = -1e9;
   function handleSpeech(transcript) {
+    lastHeard = performance.now();
     $('heard').textContent = transcript.trim().split(/\s+/).slice(-12).join(' ');
-    const spoken = transcript.split(/\s+/).map(norm).filter(Boolean).slice(-8);
+    const spoken = spokenWords(transcript).slice(-8);
     if (!spoken.length || !W.length) return;
     const last = spoken[spoken.length - 1];
-    let best = -1, bestScore = 0;
-    for (let e = pos; e < Math.min(W.length, pos + AHEAD); e++) {
+    let best = -1, bestScore = -Infinity;
+    for (let e = Math.max(0, pos - BACK); e < Math.min(W.length, pos + AHEAD); e++) {
       if (!sim(last, W[e])) continue;
       const score = alignScore(spoken, e);
-      const dist = e - pos;
-      const need = dist <= 2 ? 0.8 : dist <= 15 ? 1.6 : 2.5;
-      if (score < need) continue;
-      const adj = score - dist * 0.03;
-      if (adj > bestScore) { bestScore = adj; best = e; }
+      const d = e - pos;
+      let need, adj;
+      if (d >= 0) { need = d <= 2 ? 0.8 : d <= 15 ? 1.6 : 2.5; adj = score - d * 0.03; }  // ahead
+      else if (d >= -2) { need = 0; adj = score; }                                         // where we are
+      else { need = 3; adj = score - 0.5 + d * 0.02; }                                    // re-reading: needs strong evidence
+      if (score >= need && adj > bestScore) { bestScore = adj; best = e; }
     }
-    if (best >= 0) setPos(best + 1);
+    if (best < 0) return;
+    const p = best + 1;
+    if (p > pos || p < pos - 3) setPos(p, true);
   }
 
-  // ---------- position & scrolling ----------
+  // ---------- position & smooth scrolling ----------
+  let dp = 0;          // displayed position in words (fractional), glides ahead of pos while speaking
+  let pace = 2.3;      // words per second, learned from the speaker
+  let hist = [];       // recent {t, p} for pace estimate
+  const LEAD = 1.5;    // how far the display may run ahead of confirmed speech
+  let lines = [], lineOf = [];
   let offset = 0, target = 0;
   const readLine = () => Math.round(innerHeight * 0.32);
 
-  function setPos(p, snap) {
+  function setPos(p, fromSpeech) {
     p = Math.max(0, Math.min(W.length, p));
     const lo = Math.min(p, pos), hi = Math.max(p, pos);
-    for (let i = lo; i < hi; i++) spans[i].classList.toggle('done', i < p);
+    for (let i = lo; i < hi; i++) wSpans[i].forEach(s => s.classList.toggle('done', i < p));
+    if (fromSpeech && p > pos) {
+      const now = performance.now();
+      hist.push({ t: now, p });
+      hist = hist.filter(h => now - h.t < 6000);
+      const h0 = hist[0], secs = (now - h0.t) / 1000;
+      if (secs > 1.5) pace = Math.max(1.2, Math.min(4, pace * 0.5 + (p - h0.p) / secs * 0.5));
+    } else hist = [];
     pos = p;
-    if (snap !== false) snapToPos();
+    if (p < dp - LEAD || !fromSpeech) dp = p;
   }
-  function wordY(i) {
-    const s = spans[Math.min(i, spans.length - 1)];
-    return s ? s.offsetTop + s.offsetHeight / 2 : 0;
+
+  // line geometry, so the text moves continuously as you read along a line
+  function measure() {
+    lines = []; lineOf = [];
+    for (let i = 0; i < W.length; i++) {
+      const s = wSpans[i][0], top = s.offsetTop, L = lines[lines.length - 1];
+      if (!L || Math.abs(top - L.top) > 2) lines.push({ top, h: s.offsetHeight, a: i, b: i });
+      else L.b = i;
+      lineOf[i] = lines.length - 1;
+    }
   }
-  function snapToPos() {
-    if (!spans.length) return;
-    target = Math.max(0, wordY(pos) - readLine());
+  function lineEnd(k) { const L = lines[k], N = lines[k + 1]; return N ? N.top : L.top + L.h; }
+  function yAt(d) {
+    if (!lines.length) return 0;
+    d = Math.max(0, Math.min(W.length, d));
+    const i = Math.min(W.length - 1, Math.floor(d)), k = lineOf[i], L = lines[k];
+    return L.top + (lineEnd(k) - L.top) * (i - L.a + (d - i)) / (L.b - L.a + 1);
   }
-  function posAtOffset(off) {
-    const y = off + readLine();
-    for (let i = 0; i < spans.length; i++) if (spans[i].offsetTop + spans[i].offsetHeight >= y) return i;
-    return spans.length;
+  function dpAt(y) {
+    if (!lines.length) return 0;
+    for (let k = 0; k < lines.length; k++) {
+      const L = lines[k], end = lineEnd(k);
+      if (y < end || k === lines.length - 1)
+        return L.a + Math.max(0, Math.min(1, (y - L.top) / (end - L.top))) * (L.b - L.a + 1);
+    }
   }
   function manualScroll(dy) {
-    const max = spans.length ? wordY(spans.length - 1) : 0;
-    target = Math.max(0, Math.min(max, target + dy));
+    dp = Math.max(0, Math.min(W.length, dpAt(yAt(dp) + dy)));
+    const d = dp;
+    setPos(Math.floor(d));
+    dp = d;
+    target = Math.max(0, yAt(dp) - readLine());
     offset = target;
-    setPos(posAtOffset(target), false);
     showBar();
   }
-  function frame() {
-    offset += (target - offset) * 0.12;
-    if (Math.abs(target - offset) < 0.5) offset = target;
+
+  let lastT = 0;
+  function frame(t) {
+    const dt = Math.min(0.1, (t - lastT) / 1000 || 0);
+    lastT = t;
+    if (dp < pos) dp += (pos - dp) * Math.min(1, dt * 8);                                  // catch up with speech
+    else if (listening && t - lastHeard < 900) dp = Math.min(pos + LEAD, dp + pace * dt);    // glide while talking
+    target = Math.max(0, yAt(dp) - readLine());
+    offset += (target - offset) * Math.min(1, dt * 7);
+    if (Math.abs(target - offset) < 0.3) offset = target;
     $('content').style.transform = `translateY(${-offset}px)`;
     requestAnimationFrame(frame);
   }
@@ -249,7 +353,7 @@
       rec.onresult = e => {
         // only the tail matters; walk back until we have enough words
         let t = '';
-        for (let i = e.results.length - 1; i >= 0 && t.split(/\s+/).length < 10; i--)
+        for (let i = e.results.length - 1; i >= 0 && t.split(/\s+/).length < 16; i--)
           t = e.results[i][0].transcript + ' ' + t;
         handleSpeech(t);
       };
@@ -285,9 +389,10 @@
     $('prompter').classList.remove('hidden');
     $('content').style.fontSize = fontSize + 'px';
     setMirror(mirror);
-    layout();
-    pos = 0; offset = target = 0;
+    pos = 0; hist = [];
     setPos(0);
+    layout();
+    offset = target;
     $('heard').textContent = '';
     keepAwake();
     showBar();
@@ -309,7 +414,7 @@
   $('go').onclick = openPrompter;
   $('back').onclick = closePrompter;
   $('mic').onclick = () => listening ? stopMic() : startMic();
-  $('top').onclick = () => { setPos(0); offset = target; };
+  $('top').onclick = () => { setPos(0); offset = target = 0; };
   $('smaller').onclick = () => setSize(fontSize - 4);
   $('bigger').onclick = () => setSize(fontSize + 4);
   $('flip').onclick = () => setMirror(!mirror);
@@ -334,17 +439,19 @@
     else if (e.key === 'Escape') closePrompter();
     else if (e.key === 'm') setMirror(!mirror);
   });
+
   // first line starts at the reading line, marked by the yellow arrow
   function layout() {
     $('marker').style.top = readLine() + 'px';
     $('content').style.paddingTop = (readLine() - fontSize * 0.7) + 'px';
+    if (!$('prompter').classList.contains('hidden')) measure();
   }
-  addEventListener('resize', () => { layout(); snapToPos(); });
+  addEventListener('resize', layout);
 
   requestAnimationFrame(frame);
 
   // exposed for testing in the console
-  window.tp = { handleSpeech, get pos() { return pos; }, get words() { return W; } };
+  window.tp = { handleSpeech, spokenWords, get pos() { return pos; }, get dp() { return dp; }, get pace() { return pace; }, get words() { return W; } };
 })();
 </script>
 </body>
