@@ -25,6 +25,8 @@
     border-radius:12px; padding:14px; font:inherit; font-size:17px; line-height:1.5; }
   .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
   .row label { display:flex; gap:8px; align-items:center; }
+  .sync { display:flex; flex-wrap:wrap; gap:10px; align-items:center; font-size:14px; color:#aaa; }
+  .sync button { padding:6px 10px; font-size:14px; }
   .warn { background:#4a3b00; color:#ffe08a; padding:10px 12px; border-radius:10px; font-size:14px; }
 
   /* ---------- prompter ---------- */
@@ -51,6 +53,12 @@
 
 <section id="editor">
   <h1>Teleprompter</h1>
+  <div id="sync" class="sync hidden">
+    <span id="syncStatus"></span>
+    <span style="flex:1"></span>
+    <button id="syncOn">Zapnout synchronizaci</button>
+    <button id="syncShare" class="hidden">Připojit další zařízení</button>
+  </div>
   <div id="nosr" class="warn hidden">Tento prohlížeč neumí rozpoznávat řeč. Na iPhonu použij Safari, na počítači Chrome nebo Safari. Text půjde posouvat jen ručně.</div>
   <textarea id="text" placeholder="Sem vlož text…"></textarea>
   <div class="row">
@@ -95,9 +103,92 @@
   $('mirror').checked = mirror;
   if (!SR) $('nosr').classList.remove('hidden');
 
-  $('text').addEventListener('input', () => store.set('text', $('text').value));
+  $('text').addEventListener('input', () => { store.set('text', $('text').value); Sync.changed(); });
   $('size').addEventListener('input', e => setSize(+e.target.value));
   $('mirror').addEventListener('change', e => setMirror(e.target.checked));
+
+  // ---------- sync between devices ----------
+  // Firestore document rooms/<team code>; the long random code in the link is the only key.
+  const FIREBASE = { apiKey: '', projectId: '' };
+  const Sync = (() => {
+    if (!FIREBASE.projectId) return { changed() {} };
+    $('sync').classList.remove('hidden');
+    let room = store.get('room', null);
+    let dirty = false, ver = 0, busy = false, timer = null;
+    // opening the team link on a device joins that team (the team text wins)
+    function join() {
+      const m = location.hash.match(/[#&]t=([a-z0-9]{20,64})/);
+      if (!m) return;
+      room = m[1]; store.set('room', room); dirty = false;
+      history.replaceState(null, '', location.pathname + location.search);
+    }
+    join();
+    const url = () => `https://firestore.googleapis.com/v1/projects/${FIREBASE.projectId}/databases/(default)/documents/rooms/${room}?key=${FIREBASE.apiKey}`;
+    const status = t => { $('syncStatus').textContent = t; };
+    const offline = () => status('⚠ Bez připojení – text je uložený jen tady');
+    function ui() {
+      $('syncOn').classList.toggle('hidden', !!room);
+      $('syncShare').classList.toggle('hidden', !room);
+      if (!room) status('Text je uložený jen v tomhle zařízení');
+    }
+    async function push() {
+      busy = true; status('Ukládám…');
+      const v = ver;
+      try {
+        const r = await fetch(url(), { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fields: { body: { stringValue: $('text').value }, updatedAt: { integerValue: String(Date.now()) } } }) });
+        if (!r.ok) throw new Error(r.status);
+        if (v === ver) dirty = false;
+        status('✓ Synchronizováno');
+      } catch { offline(); }
+      busy = false;
+    }
+    async function pull() {
+      if (!room || busy || document.hidden || $('editor').classList.contains('hidden')) return;
+      if (dirty) return push();
+      busy = true;
+      try {
+        const r = await fetch(url());
+        if (r.status === 404) {                       // new team: upload what we have
+          busy = false;
+          return $('text').value ? push() : status('✓ Synchronizováno');
+        }
+        if (!r.ok) throw new Error(r.status);
+        const doc = await r.json();
+        const body = doc.fields?.body?.stringValue ?? '';
+        if (!dirty && body !== $('text').value) { $('text').value = body; store.set('text', body); }
+        status('✓ Synchronizováno');
+      } catch { offline(); }
+      busy = false;
+    }
+    function newCode() {
+      const abc = 'abcdefghijkmnpqrstuvwxyz23456789';
+      return Array.from(crypto.getRandomValues(new Uint8Array(24)), b => abc[b % abc.length]).join('');
+    }
+    $('syncOn').onclick = () => { room = newCode(); store.set('room', room); ui(); push(); };
+    $('syncShare').onclick = async () => {
+      const link = location.origin + location.pathname + '#t=' + room;
+      if (navigator.share) {
+        try { await navigator.share({ title: 'Teleprompter', url: link }); return; }
+        catch (e) { if (e.name === 'AbortError') return; }
+      }
+      try { await navigator.clipboard.writeText(link); status('Odkaz zkopírovaný – otevři ho na druhém zařízení'); }
+      catch { prompt('Otevři tenhle odkaz na druhém zařízení:', link); }
+    };
+    setInterval(pull, 5000);
+    document.addEventListener('visibilitychange', pull);
+    addEventListener('hashchange', () => { join(); ui(); pull(); });
+    ui(); pull();
+    return {
+      pull,
+      changed() {
+        if (!room) return;
+        dirty = true; ver++;
+        clearTimeout(timer);
+        timer = setTimeout(function save() { busy ? (timer = setTimeout(save, 300)) : push(); }, 800);
+      }
+    };
+  })();
 
   function setSize(v) {
     fontSize = Math.max(20, Math.min(120, v));
