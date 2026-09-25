@@ -109,7 +109,7 @@
 
   // ---------- sync between devices ----------
   // Firestore document rooms/<team code>; the long random code in the link is the only key.
-  const FIREBASE = { apiKey: '', projectId: '' };
+  const FIREBASE = { projectId: 'teleprompter-1be64' };
   const Sync = (() => {
     if (!FIREBASE.projectId) return { changed() {} };
     $('sync').classList.remove('hidden');
@@ -123,7 +123,7 @@
       history.replaceState(null, '', location.pathname + location.search);
     }
     join();
-    const url = () => `https://firestore.googleapis.com/v1/projects/${FIREBASE.projectId}/databases/(default)/documents/rooms/${room}?key=${FIREBASE.apiKey}`;
+    const url = () => `https://firestore.googleapis.com/v1/projects/${FIREBASE.projectId}/databases/(default)/documents/rooms/${room}`;
     const status = t => { $('syncStatus').textContent = t; };
     const offline = () => status('⚠ Bez připojení – text je uložený jen tady');
     function ui() {
